@@ -1,0 +1,8 @@
+# Sky is not yet in github-linguist. Elm is the closest syntactic
+# cousin (Sky derives from Elm), so treat .sky files as Elm for
+# highlighting and statistics.
+*.sky     linguist-language=Elm
+
+# The project is 100% Sky source -- don't let the TOML or markdown
+# skew GitHub's language bar.
+sky.toml  linguist-detectable=false
