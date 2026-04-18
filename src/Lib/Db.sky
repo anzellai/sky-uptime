@@ -1,0 +1,77 @@
+module Lib.Db exposing (..)
+
+-- Database layer. Every fallible operation returns Result Error a —
+-- callers MUST pattern-match. Errors flow upward as a typed ADT
+-- (Sky.Core.Error), never as a swallowed `_ = ...` discard.
+
+import Sky.Core.Prelude exposing (..)
+import Std.Db as Db
+import Sky.Core.Error as Error exposing (Error(..), ErrorKind(..))
+
+
+initSchema conn =
+    case Db.execRaw conn endpointsTable of
+        Err e ->
+            Err e
+
+        Ok _ ->
+            case Db.execRaw conn checksTable of
+                Err e ->
+                    Err e
+
+                Ok _ ->
+                    Ok ()
+
+
+endpointsTable =
+    """CREATE TABLE IF NOT EXISTS endpoints (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        url TEXT NOT NULL,
+        created_at TEXT DEFAULT (datetime('now'))
+    )"""
+
+
+checksTable =
+    """CREATE TABLE IF NOT EXISTS checks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        endpoint_id INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        status_code INTEGER DEFAULT 0,
+        error_kind TEXT DEFAULT '',
+        error_message TEXT DEFAULT '',
+        checked_at TEXT DEFAULT (datetime('now'))
+    )"""
+
+
+addEndpoint conn name url =
+    Db.exec conn
+        "INSERT INTO endpoints (name, url) VALUES (?, ?)"
+        [ name, url ]
+
+
+removeEndpoint conn idStr =
+    case Db.exec conn "DELETE FROM checks WHERE endpoint_id = ?" [ idStr ] of
+        Err e ->
+            Err e
+
+        Ok _ ->
+            Db.exec conn "DELETE FROM endpoints WHERE id = ?" [ idStr ]
+
+
+getEndpoints conn =
+    Db.query conn
+        "SELECT CAST(id AS TEXT) AS id, name, url FROM endpoints ORDER BY name"
+        []
+
+
+getLatestCheck conn endpointId =
+    Db.query conn
+        "SELECT status, CAST(status_code AS TEXT) AS status_code, error_kind, error_message, checked_at FROM checks WHERE endpoint_id = ? ORDER BY checked_at DESC LIMIT 1"
+        [ endpointId ]
+
+
+recordCheck conn endpointId status code errorKind errorMsg =
+    Db.exec conn
+        "INSERT INTO checks (endpoint_id, status, status_code, error_kind, error_message) VALUES (?, ?, ?, ?, ?)"
+        [ endpointId, status, code, errorKind, errorMsg ]

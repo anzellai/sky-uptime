@@ -1,0 +1,127 @@
+module Lib.Monitor exposing (..)
+
+-- Health check logic. The HTTP probe returns a CheckResult where the
+-- failure reason is a first-class Sky.Core.Error — not a stringy
+-- `"error: …"`. Callers can pattern-match on `ErrorKind` to decide UI
+-- colouring, retry behaviour, or severity, without string parsing.
+
+import Sky.Core.Prelude exposing (..)
+import Sky.Core.String as String
+import Sky.Core.Task as Task
+import Sky.Core.Http as Http
+import Sky.Core.Error as Error exposing (Error(..), ErrorKind(..))
+
+
+type CheckStatus
+    = Healthy
+    | Degraded
+    | Down
+
+
+statusToString : CheckStatus -> String
+statusToString s =
+    case s of
+        Healthy ->
+            "healthy"
+
+        Degraded ->
+            "degraded"
+
+        Down ->
+            "down"
+
+
+type alias CheckResult =
+    { status : CheckStatus
+    , code : Int
+    , errorKind : String
+    , errorMessage : String
+    }
+
+
+-- Http.get is `String -> Task Error Response`. Task.run gives us
+-- `Result Error Response`. Both branches must be handled; the Err
+-- branch carries the typed `Error` we surface verbatim to the UI.
+checkEndpoint : String -> CheckResult
+checkEndpoint url =
+    case Task.run (Http.get url) of
+        Ok resp ->
+            classifyResponse resp
+
+        Err err ->
+            classifyError err
+
+
+classifyResponse : Http.Response -> CheckResult
+classifyResponse resp =
+    if resp.status >= 200 && resp.status < 400 then
+        { status = Healthy
+        , code = resp.status
+        , errorKind = ""
+        , errorMessage = ""
+        }
+
+    else if resp.status >= 400 && resp.status < 500 then
+        { status = Degraded
+        , code = resp.status
+        , errorKind = "HttpStatus"
+        , errorMessage = "Client error: HTTP " ++ String.fromInt resp.status
+        }
+
+    else
+        { status = Down
+        , code = resp.status
+        , errorKind = "HttpStatus"
+        , errorMessage = "Server error: HTTP " ++ String.fromInt resp.status
+        }
+
+
+-- Map a typed Sky.Core.Error to the CheckResult domain type. Note
+-- the exhaustive match on `ErrorKind` — add a new kind in the stdlib
+-- and this function fails to compile until every variant is handled.
+classifyError : Error -> CheckResult
+classifyError err =
+    case err of
+        Error kind info ->
+            { status = statusForKind kind
+            , code = 0
+            , errorKind = Error.kindLabel kind
+            , errorMessage = info.message
+            }
+
+
+statusForKind : ErrorKind -> CheckStatus
+statusForKind kind =
+    case kind of
+        Network ->
+            Down
+
+        Timeout ->
+            Down
+
+        Unavailable ->
+            Down
+
+        NotFound ->
+            Down
+
+        Io ->
+            Down
+
+        Ffi ->
+            Down
+
+        Decode ->
+            Degraded
+
+        InvalidInput ->
+            Degraded
+
+        PermissionDenied ->
+            Degraded
+
+        Conflict ->
+            Degraded
+
+        Unexpected ->
+            Down

@@ -1,0 +1,917 @@
+module Main exposing (main)
+
+-- sky-uptime — a Sky.Live dashboard that monitors HTTP endpoints.
+--
+-- This video's thesis: proper error handling kills startups not
+-- because errors are hard, but because every language makes
+-- swallowing them the path of least resistance. Sky's Std.Core.Error
+-- ADT + Result + Task flip the incentive — the type system will
+-- literally not compile a silent failure. Every Err in this file
+-- reaches the user, annotated with its ErrorKind.
+
+import Sky.Core.Prelude exposing (..)
+import Sky.Core.List as List
+import Sky.Core.Dict as Dict
+import Sky.Core.String as String
+import Sky.Core.Maybe as Maybe
+import Sky.Core.Error as Error exposing (Error(..), ErrorKind(..))
+import Std.Html exposing (..)
+import Std.Html.Attributes exposing (..)
+import Std.Css exposing (..)
+import Std.Db as Db
+import Std.Log exposing (println)
+import Std.Live exposing (app, route)
+import Std.Live.Events exposing (onClick, onInput)
+import Std.Cmd as Cmd
+import Std.Sub as Sub
+import Std.Time as Time
+import Lib.Db as Database
+import Lib.Monitor as Monitor exposing (CheckStatus(..), CheckResult)
+
+
+-- PAGE / MODEL ==========================================================
+
+type Page
+    = HomePage
+
+
+type NoticeKind
+    = NoticeInfo
+    | NoticeOk
+    | NoticeError
+
+
+type alias Notice =
+    { kind : NoticeKind
+    , message : String
+    }
+
+
+type alias Endpoint =
+    { id : String
+    , name : String
+    , url : String
+    , status : String
+    , statusCode : String
+    , errorKind : String
+    , errorMessage : String
+    , lastChecked : String
+    }
+
+
+type alias Model =
+    { page : Page
+    , endpoints : List Endpoint
+    , nameInput : String
+    , urlInput : String
+    , notice : Maybe Notice
+    }
+
+
+type Msg
+    = AddEndpoint
+    | RemoveEndpoint String
+    | CheckAll
+    | CheckOne String
+    | Tick
+    | InputName String
+    | InputUrl String
+
+
+-- CONNECTION — opened once at startup ===================================
+-- Using Db.connect () reads the [database] section of sky.toml. The
+-- result is Result Error Db, so we unwrap at the boundary: if the DB
+-- cannot open there is no point starting the app, so we log and stop.
+
+openDb =
+    Db.connect ()
+
+
+-- INIT =================================================================
+
+init : a -> ( Model, Cmd Msg )
+init _req =
+    case openDb of
+        Err err ->
+            ( errorModel
+                ("Database unavailable — " ++ Error.toString err)
+            , Cmd.none
+            )
+
+        Ok conn ->
+            case Database.initSchema conn of
+                Err err ->
+                    ( errorModel
+                        ("Schema migration failed — " ++ Error.toString err)
+                    , Cmd.none
+                    )
+
+                Ok _ ->
+                    ( freshModel conn, Cmd.none )
+
+
+errorModel : String -> Model
+errorModel msg =
+    { page = HomePage
+    , endpoints = []
+    , nameInput = ""
+    , urlInput = ""
+    , notice = Just { kind = NoticeError, message = msg }
+    }
+
+
+freshModel conn =
+    let
+        ( endpoints, loadNotice ) =
+            loadEndpoints conn
+    in
+        { page = HomePage
+        , endpoints = endpoints
+        , nameInput = ""
+        , urlInput = ""
+        , notice = loadNotice
+        }
+
+
+-- LOAD ENDPOINTS =======================================================
+-- Two-level Result: the outer query may fail, and for each row the
+-- per-endpoint "latest check" query may fail. Any Err gets rolled up
+-- into a Notice, never silently discarded.
+
+loadEndpoints conn =
+    case Database.getEndpoints conn of
+        Err err ->
+            ( [], Just (errNotice "Load endpoints" err) )
+
+        Ok rows ->
+            ( List.map (rowToEndpoint conn) rows, Nothing )
+
+
+rowToEndpoint conn row =
+    let
+        eid =
+            getField "id" row
+
+        latest =
+            latestFor conn eid
+    in
+        { id = eid
+        , name = getField "name" row
+        , url = getField "url" row
+        , status = latest.status
+        , statusCode = latest.statusCode
+        , errorKind = latest.errorKind
+        , errorMessage = latest.errorMessage
+        , lastChecked = latest.lastChecked
+        }
+
+
+type alias LatestInfo =
+    { status : String
+    , statusCode : String
+    , errorKind : String
+    , errorMessage : String
+    , lastChecked : String
+    }
+
+
+unknownLatest : LatestInfo
+unknownLatest =
+    { status = "unknown"
+    , statusCode = ""
+    , errorKind = ""
+    , errorMessage = ""
+    , lastChecked = "never"
+    }
+
+
+latestFor conn eid =
+    case Database.getLatestCheck conn eid of
+        Err err ->
+            let
+                _ =
+                    println
+                        ("[DB ERROR] latest check for "
+                            ++ eid
+                            ++ ": "
+                            ++ Error.toString err
+                        )
+            in
+                unknownLatest
+
+        Ok rows ->
+            case List.head rows of
+                Nothing ->
+                    unknownLatest
+
+                Just row ->
+                    { status = getField "status" row
+                    , statusCode = getField "status_code" row
+                    , errorKind = getField "error_kind" row
+                    , errorMessage = getField "error_message" row
+                    , lastChecked = getField "checked_at" row
+                    }
+
+
+getField field row =
+    Maybe.withDefault "" (Dict.get field row)
+
+
+-- UPDATE ===============================================================
+
+update msg model =
+    case openDb of
+        Err err ->
+            ( { model
+                | notice =
+                    Just
+                        (errNotice "Database" err)
+              }
+            , Cmd.none
+            )
+
+        Ok conn ->
+            updateWithConn conn msg model
+
+
+updateWithConn conn msg model =
+    case msg of
+        InputName val ->
+            ( { model | nameInput = val }, Cmd.none )
+
+        InputUrl val ->
+            ( { model | urlInput = val }, Cmd.none )
+
+        AddEndpoint ->
+            handleAdd conn model
+
+        RemoveEndpoint eid ->
+            handleRemove conn model eid
+
+        CheckAll ->
+            handleCheckAll conn model
+
+        CheckOne eid ->
+            handleCheckOne conn model eid
+
+        Tick ->
+            handleTick conn model
+
+
+handleAdd conn model =
+    if String.trim model.nameInput == "" || String.trim model.urlInput == "" then
+        ( { model
+            | notice =
+                Just
+                    { kind = NoticeError
+                    , message = "Name and URL are required."
+                    }
+          }
+        , Cmd.none
+        )
+
+    else
+        case Database.addEndpoint conn model.nameInput model.urlInput of
+            Err err ->
+                ( { model | notice = Just (errNotice "Add endpoint" err) }
+                , Cmd.none
+                )
+
+            Ok _ ->
+                let
+                    added =
+                        model.nameInput
+
+                    ( endpoints, loadNotice ) =
+                        loadEndpoints conn
+
+                    notice =
+                        case loadNotice of
+                            Just err ->
+                                Just err
+
+                            Nothing ->
+                                Just
+                                    { kind = NoticeOk
+                                    , message = "Added " ++ added
+                                    }
+                in
+                    ( { model
+                        | endpoints = endpoints
+                        , nameInput = ""
+                        , urlInput = ""
+                        , notice = notice
+                      }
+                    , Cmd.none
+                    )
+
+
+handleRemove conn model eid =
+    case Database.removeEndpoint conn eid of
+        Err err ->
+            ( { model | notice = Just (errNotice "Remove" err) }
+            , Cmd.none
+            )
+
+        Ok _ ->
+            let
+                ( endpoints, loadNotice ) =
+                    loadEndpoints conn
+
+                notice =
+                    case loadNotice of
+                        Just err ->
+                            Just err
+
+                        Nothing ->
+                            Just
+                                { kind = NoticeOk
+                                , message = "Endpoint removed."
+                                }
+            in
+                ( { model | endpoints = endpoints, notice = notice }
+                , Cmd.none
+                )
+
+
+handleCheckAll conn model =
+    let
+        errs =
+            runChecks conn model.endpoints
+
+        ( endpoints, loadNotice ) =
+            loadEndpoints conn
+
+        notice =
+            case loadNotice of
+                Just err ->
+                    Just err
+
+                Nothing ->
+                    summaryNotice errs
+    in
+        ( { model | endpoints = endpoints, notice = notice }
+        , Cmd.none
+        )
+
+
+handleCheckOne conn model eid =
+    case List.head (List.filter (\e -> e.id == eid) model.endpoints) of
+        Nothing ->
+            ( { model
+                | notice =
+                    Just
+                        { kind = NoticeError
+                        , message = "Endpoint not found."
+                        }
+              }
+            , Cmd.none
+            )
+
+        Just endpoint ->
+            let
+                recordErr =
+                    runSingleCheck conn endpoint
+
+                ( endpoints, loadNotice ) =
+                    loadEndpoints conn
+
+                notice =
+                    case loadNotice of
+                        Just n ->
+                            Just n
+
+                        Nothing ->
+                            case recordErr of
+                                Just err ->
+                                    Just (errNotice "Record check" err)
+
+                                Nothing ->
+                                    Just
+                                        { kind = NoticeInfo
+                                        , message =
+                                            "Checked " ++ endpoint.name ++ "."
+                                        }
+            in
+                ( { model | endpoints = endpoints, notice = notice }
+                , Cmd.none
+                )
+
+
+handleTick conn model =
+    let
+        errs =
+            runChecks conn model.endpoints
+
+        ( endpoints, loadNotice ) =
+            loadEndpoints conn
+
+        notice =
+            case loadNotice of
+                Just n ->
+                    Just n
+
+                Nothing ->
+                    case errs of
+                        [] ->
+                            model.notice
+
+                        _ ->
+                            summaryNotice errs
+    in
+        ( { model | endpoints = endpoints, notice = notice }
+        , Cmd.none
+        )
+
+
+-- CHECK RUNNER — collects Errors rather than swallowing ================
+-- runChecks returns a List of Errors from failed record-check inserts.
+-- The HTTP failure itself is NOT an Error here — it's a legitimate
+-- "Down" result that gets persisted. Only DB-write failures propagate.
+
+runChecks : a -> List Endpoint -> List Error
+runChecks conn endpoints =
+    List.filterMap (runSingleCheck conn) endpoints
+
+
+runSingleCheck : a -> Endpoint -> Maybe Error
+runSingleCheck conn endpoint =
+    let
+        result =
+            Monitor.checkEndpoint endpoint.url
+
+        statusStr =
+            Monitor.statusToString result.status
+
+        recorded =
+            Database.recordCheck conn
+                endpoint.id
+                statusStr
+                (String.fromInt result.code)
+                result.errorKind
+                result.errorMessage
+    in
+        case recorded of
+            Err err ->
+                let
+                    _ =
+                        println
+                            ("[DB ERROR] record check for "
+                                ++ endpoint.name
+                                ++ ": "
+                                ++ Error.toString err
+                            )
+                in
+                    Just err
+
+            Ok _ ->
+                Nothing
+
+
+-- NOTICE HELPERS =======================================================
+
+errNotice : String -> Error -> Notice
+errNotice label err =
+    { kind = NoticeError
+    , message = label ++ " — " ++ Error.toString err
+    }
+
+
+summaryNotice : List Error -> Maybe Notice
+summaryNotice errs =
+    case errs of
+        [] ->
+            Just
+                { kind = NoticeInfo
+                , message = "All endpoints checked."
+                }
+
+        first :: rest ->
+            Just
+                { kind = NoticeError
+                , message =
+                    "Recorded "
+                        ++ String.fromInt (List.length errs)
+                        ++ " DB error(s). First: "
+                        ++ Error.toString first
+                }
+
+
+-- SUBSCRIPTIONS ========================================================
+
+subscriptions _model =
+    Time.every 30000 Tick
+
+
+-- VIEW =================================================================
+
+view model =
+    div []
+        [ styleNode [] styles
+        , div [ class "app" ]
+            [ viewHeader
+            , viewNotice model.notice
+            , viewAddForm model
+            , viewEndpoints model.endpoints
+            ]
+        ]
+
+
+viewHeader =
+    div [ class "header" ]
+        [ h1 [] [ text "sky-uptime" ]
+        , p [ class "subtitle" ]
+            [ text "Typed errors, propagated all the way to the UI." ]
+        ]
+
+
+viewNotice maybeNotice =
+    case maybeNotice of
+        Nothing ->
+            text ""
+
+        Just notice ->
+            div [ class ("notice notice-" ++ noticeClass notice.kind) ]
+                [ span [ class "notice-badge" ]
+                    [ text (noticeLabel notice.kind) ]
+                , span [ class "notice-msg" ] [ text notice.message ]
+                ]
+
+
+noticeClass : NoticeKind -> String
+noticeClass k =
+    case k of
+        NoticeInfo ->
+            "info"
+
+        NoticeOk ->
+            "ok"
+
+        NoticeError ->
+            "error"
+
+
+noticeLabel : NoticeKind -> String
+noticeLabel k =
+    case k of
+        NoticeInfo ->
+            "INFO"
+
+        NoticeOk ->
+            "OK"
+
+        NoticeError ->
+            "ERROR"
+
+
+viewAddForm model =
+    div [ class "add-form" ]
+        [ h2 [] [ text "Add Endpoint" ]
+        , div [ class "form-row" ]
+            [ input
+                [ class "input"
+                , attribute "placeholder" "Name (e.g. Google)"
+                , attribute "value" model.nameInput
+                , onInput InputName
+                ]
+            , input
+                [ class "input"
+                , attribute "placeholder" "URL (e.g. https://google.com)"
+                , attribute "value" model.urlInput
+                , onInput InputUrl
+                ]
+            , button [ onClick AddEndpoint, class "btn btn-add" ]
+                [ text "Add" ]
+            ]
+        ]
+
+
+viewEndpoints endpoints =
+    if List.isEmpty endpoints then
+        div [ class "empty" ]
+            [ text "No endpoints yet. Add one above to start monitoring." ]
+
+    else
+        div [ class "endpoints" ]
+            [ div [ class "endpoints-header" ]
+                [ h2 [] [ text "Endpoints" ]
+                , button [ onClick CheckAll, class "btn btn-check" ]
+                    [ text "Check All Now" ]
+                ]
+            , div [ class "endpoint-list" ]
+                (List.map viewEndpointCard endpoints)
+            ]
+
+
+viewEndpointCard endpoint =
+    div [ class ("card card-" ++ endpoint.status) ]
+        [ div [ class "card-header" ]
+            [ div [ class "card-status" ]
+                [ span [ class ("dot dot-" ++ endpoint.status) ] []
+                , span [ class "card-name" ] [ text endpoint.name ]
+                ]
+            , div [ class "card-actions" ]
+                [ button
+                    [ onClick (CheckOne endpoint.id)
+                    , class "btn-sm"
+                    ]
+                    [ text "Check" ]
+                , button
+                    [ onClick (RemoveEndpoint endpoint.id)
+                    , class "btn-sm btn-danger"
+                    ]
+                    [ text "Remove" ]
+                ]
+            ]
+        , div [ class "card-url" ] [ text endpoint.url ]
+        , div [ class "card-detail" ]
+            [ viewStatusBadge endpoint.status
+            , if endpoint.statusCode /= "" && endpoint.statusCode /= "0" then
+                span [ class "code" ]
+                    [ text ("HTTP " ++ endpoint.statusCode) ]
+
+              else
+                text ""
+            , if endpoint.errorKind /= "" then
+                span [ class "err-kind" ]
+                    [ text (endpoint.errorKind ++ ":") ]
+
+              else
+                text ""
+            , if endpoint.errorMessage /= "" then
+                span [ class "err-msg" ]
+                    [ text endpoint.errorMessage ]
+
+              else
+                text ""
+            ]
+        , div [ class "card-time" ]
+            [ text ("Last checked: " ++ endpoint.lastChecked) ]
+        ]
+
+
+viewStatusBadge status =
+    let
+        label =
+            if status == "healthy" then
+                "Healthy"
+
+            else if status == "degraded" then
+                "Degraded"
+
+            else if status == "down" then
+                "Down"
+
+            else
+                "Unknown"
+    in
+        span [ class ("badge badge-" ++ status) ] [ text label ]
+
+
+-- APP ==================================================================
+
+main =
+    app
+        { init = init
+        , update = update
+        , view = view
+        , subscriptions = subscriptions
+        , routes = [ route "/" HomePage ]
+        , notFound = HomePage
+        }
+
+
+-- STYLES ===============================================================
+
+styles =
+    stylesheet
+        [ rule "*, *::before, *::after"
+            [ property "box-sizing" "border-box"
+            , margin "0"
+            , padding "0"
+            ]
+        , rule "body"
+            [ fontFamily "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+            , property "background" "#0f172a"
+            , color (hex "f1f5f9")
+            ]
+        , rule ".app"
+            [ maxWidth (px 820)
+            , margin2 "0" "auto"
+            , padding (rem 2.0)
+            ]
+        , rule ".header" [ property "margin-bottom" "2rem" ]
+        , rule ".header h1"
+            [ fontSize (rem 2.0)
+            , color (hex "38bdf8")
+            ]
+        , rule ".subtitle"
+            [ color (hex "94a3b8")
+            , fontSize (rem 0.9)
+            , property "margin-top" "0.25rem"
+            ]
+        , rule ".notice"
+            [ display "flex"
+            , property "align-items" "center"
+            , gap (rem 0.6)
+            , padding2 (rem 0.7) (rem 1.0)
+            , borderRadius (px 8)
+            , property "margin-bottom" "1.5rem"
+            , fontSize (rem 0.85)
+            , property "border" "1px solid transparent"
+            ]
+        , rule ".notice-info"
+            [ property "background" "#0b213d"
+            , color (hex "93c5fd")
+            , property "border-color" "#1e3a8a"
+            ]
+        , rule ".notice-ok"
+            [ property "background" "#052e16"
+            , color (hex "86efac")
+            , property "border-color" "#166534"
+            ]
+        , rule ".notice-error"
+            [ property "background" "#450a0a"
+            , color (hex "fca5a5")
+            , property "border-color" "#991b1b"
+            ]
+        , rule ".notice-badge"
+            [ fontSize (rem 0.7)
+            , fontWeight "700"
+            , padding2 (rem 0.1) (rem 0.4)
+            , borderRadius (px 4)
+            , property "background" "rgba(255,255,255,0.08)"
+            , property "letter-spacing" "0.05em"
+            ]
+        , rule ".notice-msg" [ property "flex" "1" ]
+        , rule ".add-form"
+            [ property "background" "#1e293b"
+            , padding (rem 1.5)
+            , borderRadius (px 12)
+            , property "margin-bottom" "2rem"
+            ]
+        , rule ".add-form h2"
+            [ fontSize (rem 1.0)
+            , property "margin-bottom" "0.75rem"
+            , color (hex "94a3b8")
+            ]
+        , rule ".form-row"
+            [ display "flex"
+            , gap (rem 0.5)
+            ]
+        , rule ".input"
+            [ property "flex" "1"
+            , padding2 (rem 0.5) (rem 0.75)
+            , property "background" "#0f172a"
+            , border "1px solid #334155"
+            , borderRadius (px 6)
+            , color (hex "f1f5f9")
+            , fontSize (rem 0.9)
+            ]
+        , rule ".input:focus"
+            [ property "outline" "none"
+            , border "1px solid #38bdf8"
+            ]
+        , rule ".btn"
+            [ property "appearance" "none"
+            , padding2 (rem 0.5) (rem 1.0)
+            , border "none"
+            , borderRadius (px 6)
+            , cursor "pointer"
+            , fontSize (rem 0.9)
+            , fontWeight "600"
+            ]
+        , rule ".btn-add"
+            [ property "background" "#38bdf8"
+            , color (hex "0f172a")
+            ]
+        , rule ".btn-add:hover" [ property "background" "#7dd3fc" ]
+        , rule ".btn-check"
+            [ property "background" "#334155"
+            , color (hex "f1f5f9")
+            ]
+        , rule ".btn-check:hover" [ property "background" "#475569" ]
+        , rule ".btn-sm"
+            [ property "appearance" "none"
+            , padding2 (rem 0.25) (rem 0.5)
+            , border "1px solid #334155"
+            , property "background" "transparent"
+            , borderRadius (px 4)
+            , cursor "pointer"
+            , fontSize (rem 0.75)
+            , color (hex "94a3b8")
+            ]
+        , rule ".btn-sm:hover" [ property "background" "#334155" ]
+        , rule ".btn-danger:hover"
+            [ property "background" "#7f1d1d"
+            , color (hex "fca5a5")
+            ]
+        , rule ".endpoints-header"
+            [ display "flex"
+            , justifyContent "space-between"
+            , property "align-items" "center"
+            , property "margin-bottom" "1rem"
+            ]
+        , rule ".endpoints-header h2"
+            [ fontSize (rem 1.1)
+            , color (hex "94a3b8")
+            ]
+        , rule ".endpoint-list"
+            [ display "flex"
+            , property "flex-direction" "column"
+            , gap (rem 0.75)
+            ]
+        , rule ".card"
+            [ property "background" "#1e293b"
+            , padding (rem 1.0)
+            , borderRadius (px 8)
+            , property "border-left" "3px solid #334155"
+            ]
+        , rule ".card-healthy" [ property "border-left-color" "#22c55e" ]
+        , rule ".card-degraded" [ property "border-left-color" "#eab308" ]
+        , rule ".card-down" [ property "border-left-color" "#ef4444" ]
+        , rule ".card-header"
+            [ display "flex"
+            , justifyContent "space-between"
+            , property "align-items" "center"
+            ]
+        , rule ".card-status"
+            [ display "flex"
+            , property "align-items" "center"
+            , gap (rem 0.5)
+            ]
+        , rule ".card-actions"
+            [ display "flex"
+            , gap (rem 0.25)
+            ]
+        , rule ".dot"
+            [ property "width" "10px"
+            , property "height" "10px"
+            , borderRadius (px 999)
+            , property "background" "#334155"
+            ]
+        , rule ".dot-healthy" [ property "background" "#22c55e" ]
+        , rule ".dot-degraded" [ property "background" "#eab308" ]
+        , rule ".dot-down" [ property "background" "#ef4444" ]
+        , rule ".card-name"
+            [ fontWeight "600"
+            , fontSize (rem 1.0)
+            ]
+        , rule ".card-url"
+            [ color (hex "64748b")
+            , fontSize (rem 0.8)
+            , property "margin-top" "0.25rem"
+            ]
+        , rule ".card-detail"
+            [ display "flex"
+            , gap (rem 0.5)
+            , property "margin-top" "0.5rem"
+            , property "align-items" "center"
+            , property "flex-wrap" "wrap"
+            ]
+        , rule ".badge"
+            [ padding2 (rem 0.15) (rem 0.5)
+            , borderRadius (px 4)
+            , fontSize (rem 0.75)
+            , fontWeight "600"
+            ]
+        , rule ".badge-healthy"
+            [ property "background" "#052e16"
+            , color (hex "22c55e")
+            ]
+        , rule ".badge-degraded"
+            [ property "background" "#422006"
+            , color (hex "eab308")
+            ]
+        , rule ".badge-down"
+            [ property "background" "#450a0a"
+            , color (hex "ef4444")
+            ]
+        , rule ".badge-unknown"
+            [ property "background" "#1e293b"
+            , color (hex "64748b")
+            ]
+        , rule ".code"
+            [ color (hex "94a3b8")
+            , fontSize (rem 0.75)
+            ]
+        , rule ".err-kind"
+            [ color (hex "fb923c")
+            , fontSize (rem 0.75)
+            , fontWeight "600"
+            ]
+        , rule ".err-msg"
+            [ color (hex "f87171")
+            , fontSize (rem 0.75)
+            ]
+        , rule ".card-time"
+            [ color (hex "475569")
+            , fontSize (rem 0.75)
+            , property "margin-top" "0.5rem"
+            ]
+        , rule ".empty"
+            [ color (hex "64748b")
+            , textAlign "center"
+            , padding (rem 3.0)
+            ]
+        ]
