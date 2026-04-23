@@ -3,19 +3,30 @@ module Lib.Db exposing (..)
 -- Database layer. Every fallible operation returns Result Error a —
 -- callers MUST pattern-match. Errors flow upward as a typed ADT
 -- (Sky.Core.Error), never as a swallowed `_ = ...` discard.
+--
+-- Std.Db.* now returns Task Error a (effect-boundary-audit branch
+-- of the Sky compiler). Sky.Live's `update` needs synchronous
+-- answers for case-pattern matching, so this Lib layer bridges
+-- through Task.run inside each wrapper. The eager-evaluation cost
+-- matches the pre-migration semantics: monitor checks already ran
+-- DB writes inside update branches. For the recurring background
+-- probe loop, `runChecks` is dispatched via Cmd.perform which spawns
+-- a goroutine — the Task.run bridge inside `recordCheck` runs in
+-- that goroutine context, not in the dispatcher.
 
 import Sky.Core.Prelude exposing (..)
+import Sky.Core.Task as Task
 import Std.Db as Db
 import Sky.Core.Error as Error exposing (Error(..), ErrorKind(..))
 
 
 initSchema conn =
-    case Db.execRaw conn endpointsTable of
+    case Task.run (Db.execRaw conn endpointsTable) of
         Err e ->
             Err e
 
         Ok _ ->
-            case Db.execRaw conn checksTable of
+            case Task.run (Db.execRaw conn checksTable) of
                 Err e ->
                     Err e
 
@@ -45,33 +56,38 @@ checksTable =
 
 
 addEndpoint conn name url =
-    Db.exec conn
-        "INSERT INTO endpoints (name, url) VALUES (?, ?)"
-        [ name, url ]
+    Task.run
+        (Db.exec conn
+            "INSERT INTO endpoints (name, url) VALUES (?, ?)"
+            [ name, url ])
 
 
 removeEndpoint conn idStr =
-    case Db.exec conn "DELETE FROM checks WHERE endpoint_id = ?" [ idStr ] of
+    case Task.run (Db.exec conn "DELETE FROM checks WHERE endpoint_id = ?" [ idStr ]) of
         Err e ->
             Err e
 
         Ok _ ->
-            Db.exec conn "DELETE FROM endpoints WHERE id = ?" [ idStr ]
+            Task.run (Db.exec conn "DELETE FROM endpoints WHERE id = ?" [ idStr ])
 
 
 getEndpoints conn =
-    Db.query conn
-        "SELECT CAST(id AS TEXT) AS id, name, url FROM endpoints ORDER BY name"
-        []
+    Task.run
+        (Db.query conn
+            "SELECT CAST(id AS TEXT) AS id, name, url FROM endpoints ORDER BY name"
+            [])
 
 
 getLatestCheck conn endpointId =
-    Db.query conn
-        "SELECT status, CAST(status_code AS TEXT) AS status_code, error_kind, error_message, checked_at FROM checks WHERE endpoint_id = ? ORDER BY checked_at DESC LIMIT 1"
-        [ endpointId ]
+    Task.run
+        (Db.query conn
+            "SELECT status, CAST(status_code AS TEXT) AS status_code, error_kind, error_message, checked_at FROM checks WHERE endpoint_id = ? ORDER BY checked_at DESC LIMIT 1"
+            [ endpointId ])
 
 
+recordCheck : Db -> String -> String -> String -> String -> String -> Result Error Int
 recordCheck conn endpointId status code errorKind errorMsg =
-    Db.exec conn
-        "INSERT INTO checks (endpoint_id, status, status_code, error_kind, error_message) VALUES (?, ?, ?, ?, ?)"
-        [ endpointId, status, code, errorKind, errorMsg ]
+    Task.run
+        (Db.exec conn
+            "INSERT INTO checks (endpoint_id, status, status_code, error_kind, error_message) VALUES (?, ?, ?, ?, ?)"
+            [ endpointId, status, code, errorKind, errorMsg ])

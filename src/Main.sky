@@ -15,6 +15,7 @@ import Sky.Core.Dict as Dict
 import Sky.Core.String as String
 import Sky.Core.Maybe as Maybe
 import Sky.Core.Error as Error exposing (Error(..), ErrorKind(..))
+import Sky.Core.Task as Task
 import Std.Html exposing (..)
 import Std.Html.Attributes exposing (..)
 import Std.Css exposing (..)
@@ -80,11 +81,13 @@ type Msg
 
 -- CONNECTION — opened once at startup ===================================
 -- Using Db.connect () reads the [database] section of sky.toml. The
--- result is Result Error Db, so we unwrap at the boundary: if the DB
--- cannot open there is no point starting the app, so we log and stop.
+-- effect-boundary-audit branch made it Task Error Db, so Task.run
+-- forces it eagerly here at module init. If the DB cannot open
+-- there is no point starting the app — `init` reports the error and
+-- the app shows an error model.
 
 openDb =
-    Db.connect ()
+    Task.run (Db.connect ())
 
 
 -- INIT =================================================================
