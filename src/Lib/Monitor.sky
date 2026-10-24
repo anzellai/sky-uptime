@@ -11,7 +11,6 @@ import Sky.Core.Task as Task
 import Sky.Core.Http as Http
 import Sky.Core.Error as Error exposing (Error(..), ErrorKind(..))
 
-
 type CheckStatus
     = Healthy
     | Degraded
@@ -21,6 +20,7 @@ type CheckStatus
 statusToString : CheckStatus -> String
 statusToString s =
     case s of
+
         Healthy ->
             "healthy"
 
@@ -29,7 +29,6 @@ statusToString s =
 
         Down ->
             "down"
-
 
 type alias CheckResult =
     { status : CheckStatus
@@ -45,6 +44,7 @@ type alias CheckResult =
 checkEndpoint : String -> CheckResult
 checkEndpoint url =
     case Task.run (Http.get url) of
+
         Ok resp ->
             classifyResponse resp
 
@@ -52,7 +52,7 @@ checkEndpoint url =
             classifyError err
 
 
-classifyResponse : Http.Response -> CheckResult
+classifyResponse : Http.HttpResponse -> CheckResult
 classifyResponse resp =
     if resp.status >= 200 && resp.status < 400 then
         { status = Healthy
@@ -82,6 +82,7 @@ classifyResponse resp =
 classifyError : Error -> CheckResult
 classifyError err =
     case err of
+
         Error kind info ->
             { status = statusForKind kind
             , code = 0
@@ -93,6 +94,7 @@ classifyError err =
 statusForKind : ErrorKind -> CheckStatus
 statusForKind kind =
     case kind of
+
         Network ->
             Down
 

@@ -22,11 +22,13 @@ import Sky.Core.Error as Error exposing (Error(..), ErrorKind(..))
 
 initSchema conn =
     case Task.run (Db.execRaw conn endpointsTable) of
+
         Err e ->
             Err e
 
         Ok _ ->
             case Task.run (Db.execRaw conn checksTable) of
+
                 Err e ->
                     Err e
 
@@ -57,30 +59,36 @@ checksTable =
 
 addEndpoint conn name url =
     Task.run
-        (Db.exec conn
+        (Db.exec
+            conn
             "INSERT INTO endpoints (name, url) VALUES (?, ?)"
             [ name, url ])
 
 
 removeEndpoint conn idStr =
-    case Task.run (Db.exec conn "DELETE FROM checks WHERE endpoint_id = ?" [ idStr ]) of
+    case Task.run
+             (Db.exec conn "DELETE FROM checks WHERE endpoint_id = ?" [ idStr ]) of
+
         Err e ->
             Err e
 
         Ok _ ->
-            Task.run (Db.exec conn "DELETE FROM endpoints WHERE id = ?" [ idStr ])
+            Task.run
+                (Db.exec conn "DELETE FROM endpoints WHERE id = ?" [ idStr ])
 
 
 getEndpoints conn =
     Task.run
-        (Db.query conn
+        (Db.query
+            conn
             "SELECT CAST(id AS TEXT) AS id, name, url FROM endpoints ORDER BY name"
             [])
 
 
 getLatestCheck conn endpointId =
     Task.run
-        (Db.query conn
+        (Db.query
+            conn
             "SELECT status, CAST(status_code AS TEXT) AS status_code, error_kind, error_message, checked_at FROM checks WHERE endpoint_id = ? ORDER BY checked_at DESC LIMIT 1"
             [ endpointId ])
 
@@ -88,6 +96,7 @@ getLatestCheck conn endpointId =
 recordCheck : Db -> String -> String -> String -> String -> String -> Result Error Int
 recordCheck conn endpointId status code errorKind errorMsg =
     Task.run
-        (Db.exec conn
+        (Db.exec
+            conn
             "INSERT INTO checks (endpoint_id, status, status_code, error_kind, error_message) VALUES (?, ?, ?, ?, ?)"
             [ endpointId, status, code, errorKind, errorMsg ])
