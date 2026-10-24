@@ -28,7 +28,7 @@ Every language I've shipped in lets you make the wrong decision easily:
 - Go `if err != nil { return nil, err }` (the original context disappears)
 - TypeScript `await fetch(url)` with no `.catch()` in sight
 
-In Sky 0.9+, `Sky.Core.Error` is a tagged union with eleven variants shared by
+In Sky, `Sky.Core.Error` is a tagged union with eleven variants shared by
 the whole standard library and every generated Go FFI wrapper. You cannot use
 the return value of a fallible function without pattern-matching on it, and you
 cannot pattern-match without the compiler checking you've covered every
@@ -53,7 +53,7 @@ sky-uptime/
 
 ## Build and run
 
-Requires [Sky](https://github.com/anzellai/sky) v0.9+ on your path.
+Requires [Sky](https://github.com/anzellai/sky) v0.27.14+ on your path.
 
 ```bash
 git clone https://github.com/anzellai/sky-uptime.git
