@@ -49,6 +49,8 @@ sky-uptime/
                          for consistent string-typed identifiers
       Monitor.sky     -- the HTTP probe: Task Error Response -> CheckResult
                          with a classifyError that pattern-matches on ErrorKind
+  tests/
+    MonitorTest.sky   -- Sky.Test unit tests for the pure Lib.Monitor logic
 ```
 
 ## Build and run
@@ -74,7 +76,7 @@ Run these from the repository root (where `sky.toml` lives):
 ```bash
 sky check        # type-check the project (entry: src/Main.sky)
 sky fmt src/Main.sky src/Lib/*.sky   # format (add --check to only verify)
-sky test         # run tests (no tests/ directory yet, so nothing to run)
+sky test tests/MonitorTest.sky   # run the Lib.Monitor unit tests
 ```
 
 ## The key piece of the puzzle

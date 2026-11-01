@@ -1,0 +1,117 @@
+module MonitorTest exposing (tests)
+
+-- Pure-logic tests for Lib.Monitor. No network or database access.
+
+import Sky.Core.Prelude exposing (..)
+import Sky.Core.String as String
+import Sky.Core.Http as Http
+import Sky.Core.Dict as Dict
+import Sky.Core.Error exposing (ErrorKind(..))
+import Sky.Test as Test
+import Lib.Monitor as Monitor exposing (CheckStatus(..))
+
+
+response : Int -> Http.HttpResponse
+response n =
+    { status = n, body = "", headers = Dict.empty }
+
+
+healthyCase : Int -> Test.Test
+healthyCase n =
+    Test.test
+        ("classifyResponse " ++ String.fromInt n ++ " is Healthy")
+        (\_ ->
+            Test.equal
+                { status = Healthy
+                , code = n
+                , errorKind = ""
+                , errorMessage = ""
+                }
+                (Monitor.classifyResponse (response n)))
+
+
+degradedCase : Int -> Test.Test
+degradedCase n =
+    Test.test
+        ("classifyResponse " ++ String.fromInt n ++ " is Degraded")
+        (\_ ->
+            Test.equal
+                { status = Degraded
+                , code = n
+                , errorKind = "HttpStatus"
+                , errorMessage = "Client error: HTTP " ++ String.fromInt n
+                }
+                (Monitor.classifyResponse (response n)))
+
+
+downCase : Int -> Test.Test
+downCase n =
+    Test.test
+        ("classifyResponse " ++ String.fromInt n ++ " is Down")
+        (\_ ->
+            Test.equal
+                { status = Down
+                , code = n
+                , errorKind = "HttpStatus"
+                , errorMessage = "Server error: HTTP " ++ String.fromInt n
+                }
+                (Monitor.classifyResponse (response n)))
+
+
+kindCase : String -> ErrorKind -> CheckStatus -> Test.Test
+kindCase label kind expected =
+    Test.test
+        ("statusForKind " ++ label)
+        (\_ -> Test.equal expected (Monitor.statusForKind kind))
+
+
+tests : List Test.Test
+tests =
+    [ Test.suite
+          "Lib.Monitor"
+          [ Test.suite
+                "classifyResponse"
+                [ healthyCase 200
+                , healthyCase 204
+                , healthyCase 299
+                , healthyCase 301
+                , healthyCase 399
+                , degradedCase 400
+                , degradedCase 404
+                , degradedCase 499
+                , downCase 500
+                , downCase 503
+                , downCase 599
+                ]
+          , Test.suite
+                "statusForKind"
+                [ kindCase "Network" Network Down
+                , kindCase "Timeout" Timeout Down
+                , kindCase "Unavailable" Unavailable Down
+                , kindCase "NotFound" NotFound Down
+                , kindCase "Io" Io Down
+                , kindCase "Ffi" Ffi Down
+                , kindCase "Unexpected" Unexpected Down
+                , kindCase "Decode" Decode Degraded
+                , kindCase "InvalidInput" InvalidInput Degraded
+                , kindCase "PermissionDenied" PermissionDenied Degraded
+                , kindCase "Conflict" Conflict Degraded
+                ]
+          , Test.suite
+                "statusToString"
+                [ Test.test
+                      "healthy"
+                      (\_ ->
+                          Test.equal "healthy" (Monitor.statusToString Healthy))
+                , Test.test
+                      "degraded"
+                      (\_ ->
+                          Test.equal
+                              "degraded"
+                              (Monitor.statusToString Degraded))
+                , Test.test
+                      "down"
+                      (\_ -> Test.equal "down" (Monitor.statusToString Down))
+                ]
+          ]
+    ]
