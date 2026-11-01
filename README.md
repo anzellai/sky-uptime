@@ -67,6 +67,16 @@ Open <http://localhost:3000>.
 Add a few endpoints. Try one that resolves, one that 500s, and one with a
 made-up host name. Click **Check All Now**. Watch the error kinds surface.
 
+## Development
+
+Run these from the repository root (where `sky.toml` lives):
+
+```bash
+sky check        # type-check the project (entry: src/Main.sky)
+sky fmt src/Main.sky src/Lib/*.sky   # format (add --check to only verify)
+sky test         # run tests (no tests/ directory yet, so nothing to run)
+```
+
 ## The key piece of the puzzle
 
 The whole ADT propagation story in one function (from `src/Lib/Monitor.sky`):
