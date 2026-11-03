@@ -394,12 +394,12 @@ handleTick conn model =
 -- runChecks returns a List of Errors from failed record-check inserts.
 -- The HTTP failure itself is NOT an Error here — it's a legitimate
 -- "Down" result that gets persisted. Only DB-write failures propagate.
-runChecks : a -> List Endpoint -> List Error
+runChecks : Db.Db -> List Endpoint -> List Error
 runChecks conn endpoints =
     List.filterMap (runSingleCheck conn) endpoints
 
 
-runSingleCheck : a -> Endpoint -> Maybe Error
+runSingleCheck : Db.Db -> Endpoint -> Maybe Error
 runSingleCheck conn endpoint =
     let
         result = Monitor.checkEndpoint endpoint.url
